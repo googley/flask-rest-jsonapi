@@ -75,6 +75,10 @@ class Resource(MethodView):
         except Exception as e:
             if current_app.config['DEBUG'] is True:
                 raise e
+
+            if 'sentry' in current_app.extensions:
+                current_app.extensions['sentry'].captureException()
+
             exc = JsonApiException(getattr(e, 'detail', str(e)),
                                    source=getattr(e, 'source', ''),
                                    title=getattr(e, 'title', None),
@@ -138,7 +142,7 @@ class ResourceList(with_metaclass(ResourceMeta, Resource)):
         add_pagination_links(result,
                              objects_count,
                              qs,
-                             url_for(self.view, **view_kwargs))
+                             url_for(self.view, _external=True, **view_kwargs))
 
         result.update({'meta': {'count': objects_count}})
 
@@ -149,7 +153,7 @@ class ResourceList(with_metaclass(ResourceMeta, Resource)):
     @check_method_requirements
     def post(self, *args, **kwargs):
         """Create an object"""
-        json_data = request.get_json()
+        json_data = request.get_json() or {}
 
         qs = QSManager(request.args, self.schema)
 
@@ -214,9 +218,9 @@ class ResourceDetail(with_metaclass(ResourceMeta, Resource)):
         """Get object details"""
         self.before_get(args, kwargs)
 
-        obj = self._data_layer.get_object(kwargs)
-
         qs = QSManager(request.args, self.schema)
+
+        obj = self._data_layer.get_object(kwargs, qs=qs)
 
         schema = compute_schema(self.schema,
                                 getattr(self, 'get_schema_kwargs', dict()),
@@ -232,7 +236,7 @@ class ResourceDetail(with_metaclass(ResourceMeta, Resource)):
     @check_method_requirements
     def patch(self, *args, **kwargs):
         """Update an object"""
-        json_data = request.get_json()
+        json_data = request.get_json() or {}
 
         qs = QSManager(request.args, self.schema)
         schema_kwargs = getattr(self, 'patch_schema_kwargs', dict())
@@ -273,7 +277,7 @@ class ResourceDetail(with_metaclass(ResourceMeta, Resource)):
 
         self.before_patch(args, kwargs, data=data)
 
-        obj = self._data_layer.get_object(kwargs)
+        obj = self._data_layer.get_object(kwargs, qs=qs)
         self._data_layer.update_object(obj, data, kwargs)
 
         result = schema.dump(obj).data
@@ -354,7 +358,7 @@ class ResourceRelationship(with_metaclass(ResourceMeta, Resource)):
     @check_method_requirements
     def post(self, *args, **kwargs):
         """Add / create relationship(s)"""
-        json_data = request.get_json()
+        json_data = request.get_json() or {}
 
         relationship_field, model_relationship_field, related_type_, related_id_field = self._get_relationship_data()
 
@@ -384,27 +388,21 @@ class ResourceRelationship(with_metaclass(ResourceMeta, Resource)):
                                                              related_id_field,
                                                              kwargs)
 
-        qs = QSManager(request.args, self.schema)
-        includes = qs.include
-        if relationship_field not in qs.include:
-            includes.append(relationship_field)
-        schema = compute_schema(self.schema, dict(), qs, includes)
+        status_code = 200
+        result = {'meta': {'message': 'Relationship successfully created'}}
 
         if updated is False:
-            return '', 204
-
-        result = schema.dump(obj_).data
-        if result.get('links', {}).get('self') is not None:
-            result['links']['self'] = request.path
+            result = ''
+            status_code = 204
 
         self.after_post(result)
 
-        return result, 200
+        return result, status_code
 
     @check_method_requirements
     def patch(self, *args, **kwargs):
         """Update a relationship"""
-        json_data = request.get_json()
+        json_data = request.get_json() or {}
 
         relationship_field, model_relationship_field, related_type_, related_id_field = self._get_relationship_data()
 
@@ -434,27 +432,21 @@ class ResourceRelationship(with_metaclass(ResourceMeta, Resource)):
                                                              related_id_field,
                                                              kwargs)
 
-        qs = QSManager(request.args, self.schema)
-        includes = qs.include
-        if relationship_field not in qs.include:
-            includes.append(relationship_field)
-        schema = compute_schema(self.schema, dict(), qs, includes)
+        status_code = 200
+        result = {'meta': {'message': 'Relationship successfully updated'}}
 
         if updated is False:
-            return '', 204
-
-        result = schema.dump(obj_).data
-        if result.get('links', {}).get('self') is not None:
-            result['links']['self'] = request.path
+            result = ''
+            status_code = 204
 
         self.after_patch(result)
 
-        return result, 200
+        return result, status_code
 
     @check_method_requirements
     def delete(self, *args, **kwargs):
         """Delete relationship(s)"""
-        json_data = request.get_json()
+        json_data = request.get_json() or {}
 
         relationship_field, model_relationship_field, related_type_, related_id_field = self._get_relationship_data()
 
@@ -484,16 +476,12 @@ class ResourceRelationship(with_metaclass(ResourceMeta, Resource)):
                                                              related_id_field,
                                                              kwargs)
 
-        qs = QSManager(request.args, self.schema)
-        includes = qs.include
-        if relationship_field not in qs.include:
-            includes.append(relationship_field)
-        schema = compute_schema(self.schema, dict(), qs, includes)
+        status_code = 200
+        result = {'meta': {'message': 'Relationship successfully updated'}}
 
-        status_code = 200 if updated is True else 204
-        result = schema.dump(obj_).data
-        if result.get('links', {}).get('self') is not None:
-            result['links']['self'] = request.path
+        if updated is False:
+            result = ''
+            status_code = 204
 
         self.after_delete(result)
 
