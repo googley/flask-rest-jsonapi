@@ -3,22 +3,23 @@
 """This module contains the logic of resource management"""
 
 import inspect
+import json
 from six import with_metaclass
 
 from werkzeug.wrappers import Response
-from flask import request, url_for, make_response, current_app, jsonify
+from flask import request, url_for, make_response
 from flask.views import MethodView, MethodViewType
 from marshmallow_jsonapi.exceptions import IncorrectTypeError
 from marshmallow import ValidationError
 
-from flask_rest_jsonapi.errors import jsonapi_errors
 from flask_rest_jsonapi.querystring import QueryStringManager as QSManager
 from flask_rest_jsonapi.pagination import add_pagination_links
-from flask_rest_jsonapi.exceptions import InvalidType, BadRequest, JsonApiException, RelationNotFound
-from flask_rest_jsonapi.decorators import check_headers, check_method_requirements
+from flask_rest_jsonapi.exceptions import InvalidType, BadRequest, RelationNotFound
+from flask_rest_jsonapi.decorators import check_headers, check_method_requirements, jsonapi_exception_formatter
 from flask_rest_jsonapi.schema import compute_schema, get_relationships, get_model_field
 from flask_rest_jsonapi.data_layers.base import BaseDataLayer
 from flask_rest_jsonapi.data_layers.alchemy import SqlalchemyDataLayer
+from flask_rest_jsonapi.utils import JSONEncoder
 
 
 class ResourceMeta(MethodViewType):
@@ -57,6 +58,7 @@ class Resource(MethodView):
 
         return super(Resource, cls).__new__(cls)
 
+    @jsonapi_exception_formatter
     def dispatch_request(self, *args, **kwargs):
         """Logic of how to handle a request"""
         method = getattr(self, request.method.lower(), None)
@@ -66,30 +68,7 @@ class Resource(MethodView):
 
         headers = {'Content-Type': 'application/vnd.api+json'}
 
-        try:
-            response = method(*args, **kwargs)
-        except JsonApiException as e:
-            return make_response(jsonify(jsonapi_errors([e.to_dict()])),
-                                 e.status,
-                                 headers)
-        except Exception as e:
-            if current_app.config['DEBUG'] is True:
-                raise e
-
-            if 'sentry' in current_app.extensions:
-                current_app.extensions['sentry'].captureException()
-
-            exc = JsonApiException(getattr(e, 'detail', str(e)),
-                                   source=getattr(e, 'source', ''),
-                                   title=getattr(e, 'title', None),
-                                   status=getattr(e, 'status', None),
-                                   code=getattr(e, 'code', None),
-                                   id_=getattr(e, 'id', None),
-                                   links=getattr(e, 'links', None),
-                                   meta=getattr(e, 'meta', None))
-            return make_response(jsonify(jsonapi_errors([exc.to_dict()])),
-                                 exc.status,
-                                 headers)
+        response = method(*args, **kwargs)
 
         if isinstance(response, Response):
             response.headers.add('Content-Type', 'application/vnd.api+json')
@@ -98,7 +77,7 @@ class Resource(MethodView):
         if not isinstance(response, tuple):
             if isinstance(response, dict):
                 response.update({'jsonapi': {'version': '1.0'}})
-            return make_response(jsonify(response), 200, headers)
+            return make_response(json.dumps(response, cls=JSONEncoder), 200, headers)
 
         try:
             data, status_code, headers = response
@@ -114,7 +93,7 @@ class Resource(MethodView):
         if isinstance(data, dict):
             data.update({'jsonapi': {'version': '1.0'}})
 
-        return make_response(jsonify(data), status_code, headers)
+        return make_response(json.dumps(data, cls=JSONEncoder), status_code, headers)
 
 
 class ResourceList(with_metaclass(ResourceMeta, Resource)):
@@ -126,10 +105,13 @@ class ResourceList(with_metaclass(ResourceMeta, Resource)):
         self.before_get(args, kwargs)
 
         qs = QSManager(request.args, self.schema)
-        objects_count, objects = self._data_layer.get_collection(qs, kwargs)
+
+        objects_count, objects = self.get_collection(qs, kwargs)
 
         schema_kwargs = getattr(self, 'get_schema_kwargs', dict())
         schema_kwargs.update({'many': True})
+
+        self.before_marshmallow(args, kwargs)
 
         schema = compute_schema(self.schema,
                                 schema_kwargs,
@@ -146,9 +128,9 @@ class ResourceList(with_metaclass(ResourceMeta, Resource)):
 
         result.update({'meta': {'count': objects_count}})
 
-        self.after_get(result)
+        final_result = self.after_get(result)
 
-        return result
+        return final_result
 
     @check_method_requirements
     def post(self, *args, **kwargs):
@@ -185,13 +167,18 @@ class ResourceList(with_metaclass(ResourceMeta, Resource)):
 
         self.before_post(args, kwargs, data=data)
 
-        obj = self._data_layer.create_object(data, kwargs)
+        obj = self.create_object(data, kwargs)
 
         result = schema.dump(obj).data
 
-        self.after_post(result)
+        if result['data'].get('links', {}).get('self'):
+            final_result = (result, 201, {'Location': result['data']['links']['self']})
+        else:
+            final_result = (result, 201)
 
-        return result, 201, {'Location': result['data']['links']['self']}
+        result = self.after_post(final_result)
+
+        return result
 
     def before_get(self, args, kwargs):
         """Hook to make custom work before get method"""
@@ -199,7 +186,7 @@ class ResourceList(with_metaclass(ResourceMeta, Resource)):
 
     def after_get(self, result):
         """Hook to make custom work after get method"""
-        pass
+        return result
 
     def before_post(self, args, kwargs, data=None):
         """Hook to make custom work before post method"""
@@ -207,7 +194,16 @@ class ResourceList(with_metaclass(ResourceMeta, Resource)):
 
     def after_post(self, result):
         """Hook to make custom work after post method"""
+        return result
+
+    def before_marshmallow(self, args, kwargs):
         pass
+
+    def get_collection(self, qs, kwargs):
+        return self._data_layer.get_collection(qs, kwargs)
+
+    def create_object(self, data, kwargs):
+        return self._data_layer.create_object(data, kwargs)
 
 
 class ResourceDetail(with_metaclass(ResourceMeta, Resource)):
@@ -220,7 +216,9 @@ class ResourceDetail(with_metaclass(ResourceMeta, Resource)):
 
         qs = QSManager(request.args, self.schema)
 
-        obj = self._data_layer.get_object(kwargs, qs=qs)
+        obj = self.get_object(kwargs, qs)
+
+        self.before_marshmallow(args, kwargs)
 
         schema = compute_schema(self.schema,
                                 getattr(self, 'get_schema_kwargs', dict()),
@@ -229,9 +227,9 @@ class ResourceDetail(with_metaclass(ResourceMeta, Resource)):
 
         result = schema.dump(obj).data
 
-        self.after_get(result)
+        final_result = self.after_get(result)
 
-        return result
+        return final_result
 
     @check_method_requirements
     def patch(self, *args, **kwargs):
@@ -241,6 +239,8 @@ class ResourceDetail(with_metaclass(ResourceMeta, Resource)):
         qs = QSManager(request.args, self.schema)
         schema_kwargs = getattr(self, 'patch_schema_kwargs', dict())
         schema_kwargs.update({'partial': True})
+
+        self.before_marshmallow(args, kwargs)
 
         schema = compute_schema(self.schema,
                                 schema_kwargs,
@@ -271,34 +271,32 @@ class ResourceDetail(with_metaclass(ResourceMeta, Resource)):
         if 'id' not in json_data['data']:
             raise BadRequest('Missing id in "data" node',
                              source={'pointer': '/data/id'})
-        if json_data['data']['id'] != str(kwargs[self.data_layer.get('url_field', 'id')]):
+        if (str(json_data['data']['id']) != str(kwargs[getattr(self._data_layer, 'url_field', 'id')])):
             raise BadRequest('Value of id does not match the resource identifier in url',
                              source={'pointer': '/data/id'})
 
         self.before_patch(args, kwargs, data=data)
 
-        obj = self._data_layer.get_object(kwargs, qs=qs)
-        self._data_layer.update_object(obj, data, kwargs)
+        obj = self.update_object(data, qs, kwargs)
 
         result = schema.dump(obj).data
 
-        self.after_patch(result)
+        final_result = self.after_patch(result)
 
-        return result
+        return final_result
 
     @check_method_requirements
     def delete(self, *args, **kwargs):
         """Delete an object"""
         self.before_delete(args, kwargs)
 
-        obj = self._data_layer.get_object(kwargs)
-        self._data_layer.delete_object(obj, kwargs)
+        self.delete_object(kwargs)
 
         result = {'meta': {'message': 'Object successfully deleted'}}
 
-        self.after_delete(result)
+        final_result = self.after_delete(result)
 
-        return result
+        return final_result
 
     def before_get(self, args, kwargs):
         """Hook to make custom work before get method"""
@@ -306,7 +304,7 @@ class ResourceDetail(with_metaclass(ResourceMeta, Resource)):
 
     def after_get(self, result):
         """Hook to make custom work after get method"""
-        pass
+        return result
 
     def before_patch(self, args, kwargs, data=None):
         """Hook to make custom work before patch method"""
@@ -314,7 +312,7 @@ class ResourceDetail(with_metaclass(ResourceMeta, Resource)):
 
     def after_patch(self, result):
         """Hook to make custom work after patch method"""
-        pass
+        return result
 
     def before_delete(self, args, kwargs):
         """Hook to make custom work before delete method"""
@@ -322,7 +320,23 @@ class ResourceDetail(with_metaclass(ResourceMeta, Resource)):
 
     def after_delete(self, result):
         """Hook to make custom work after delete method"""
+        return result
+
+    def before_marshmallow(self, args, kwargs):
         pass
+
+    def get_object(self, kwargs, qs):
+        return self._data_layer.get_object(kwargs, qs=qs)
+
+    def update_object(self, data, qs, kwargs):
+        obj = self._data_layer.get_object(kwargs, qs=qs)
+        self._data_layer.update_object(obj, data, kwargs)
+
+        return obj
+
+    def delete_object(self, kwargs):
+        obj = self._data_layer.get_object(kwargs)
+        self._data_layer.delete_object(obj, kwargs)
 
 
 class ResourceRelationship(with_metaclass(ResourceMeta, Resource)):
@@ -351,9 +365,9 @@ class ResourceRelationship(with_metaclass(ResourceMeta, Resource)):
             serialized_obj = schema.dump(obj)
             result['included'] = serialized_obj.data.get('included', dict())
 
-        self.after_get(result)
+        final_result = self.after_get(result)
 
-        return result
+        return final_result
 
     @check_method_requirements
     def post(self, *args, **kwargs):
@@ -395,9 +409,9 @@ class ResourceRelationship(with_metaclass(ResourceMeta, Resource)):
             result = ''
             status_code = 204
 
-        self.after_post(result)
+        final_result = self.after_post(result, status_code)
 
-        return result, status_code
+        return final_result
 
     @check_method_requirements
     def patch(self, *args, **kwargs):
@@ -439,9 +453,9 @@ class ResourceRelationship(with_metaclass(ResourceMeta, Resource)):
             result = ''
             status_code = 204
 
-        self.after_patch(result)
+        final_result = self.after_patch(result, status_code)
 
-        return result, status_code
+        return final_result
 
     @check_method_requirements
     def delete(self, *args, **kwargs):
@@ -483,13 +497,13 @@ class ResourceRelationship(with_metaclass(ResourceMeta, Resource)):
             result = ''
             status_code = 204
 
-        self.after_delete(result)
+        final_result = self.after_delete(result, status_code)
 
-        return result, status_code
+        return final_result
 
     def _get_relationship_data(self):
         """Get useful data for relationship management"""
-        relationship_field = request.path.split('/')[-1]
+        relationship_field = request.path.split('/')[-1].replace('-', '_')
 
         if relationship_field not in get_relationships(self.schema):
             raise RelationNotFound("{} has no attribute {}".format(self.schema.__name__, relationship_field))
@@ -506,28 +520,28 @@ class ResourceRelationship(with_metaclass(ResourceMeta, Resource)):
 
     def after_get(self, result):
         """Hook to make custom work after get method"""
-        pass
+        return result
 
     def before_post(self, args, kwargs, json_data=None):
         """Hook to make custom work before post method"""
         pass
 
-    def after_post(self, result):
+    def after_post(self, result, status_code):
         """Hook to make custom work after post method"""
-        pass
+        return result, status_code
 
     def before_patch(self, args, kwargs, json_data=None):
         """Hook to make custom work before patch method"""
         pass
 
-    def after_patch(self, result):
+    def after_patch(self, result, status_code):
         """Hook to make custom work after patch method"""
-        pass
+        return result, status_code
 
     def before_delete(self, args, kwargs, json_data=None):
         """Hook to make custom work before delete method"""
         pass
 
-    def after_delete(self, result):
+    def after_delete(self, result, status_code):
         """Hook to make custom work after delete method"""
-        pass
+        return result, status_code

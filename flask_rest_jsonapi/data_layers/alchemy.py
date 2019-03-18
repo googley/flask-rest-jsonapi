@@ -5,16 +5,17 @@
 from sqlalchemy.orm.exc import NoResultFound
 from sqlalchemy.orm.collections import InstrumentedList
 from sqlalchemy.inspection import inspect
-from sqlalchemy.orm import joinedload
+from sqlalchemy.orm.attributes import QueryableAttribute
+from sqlalchemy.orm import joinedload, ColumnProperty, RelationshipProperty
 from marshmallow import class_registry
 from marshmallow.base import SchemaABC
 
 from flask import current_app
 from flask_rest_jsonapi.data_layers.base import BaseDataLayer
 from flask_rest_jsonapi.exceptions import RelationNotFound, RelatedObjectNotFound, JsonApiException,\
-    InvalidSort, ObjectNotFound, InvalidInclude
+    InvalidSort, ObjectNotFound, InvalidInclude, InvalidType
 from flask_rest_jsonapi.data_layers.filtering.alchemy import create_filters
-from flask_rest_jsonapi.schema import get_model_field, get_related_schema, get_relationships, get_schema_field
+from flask_rest_jsonapi.schema import get_model_field, get_related_schema, get_relationships, get_nested_fields, get_schema_field
 
 
 class SqlalchemyDataLayer(BaseDataLayer):
@@ -44,13 +45,21 @@ class SqlalchemyDataLayer(BaseDataLayer):
         self.before_create_object(data, view_kwargs)
 
         relationship_fields = get_relationships(self.resource.schema, model_field=True)
+        nested_fields = get_nested_fields(self.resource.schema, model_field=True)
+
+        join_fields = relationship_fields + nested_fields
+
         obj = self.model(**{key: value
-                            for (key, value) in data.items() if key not in relationship_fields})
+                            for (key, value) in data.items() if key not in join_fields})
         self.apply_relationships(data, obj)
+        self.apply_nested_fields(data, obj)
 
         self.session.add(obj)
         try:
             self.session.commit()
+        except JsonApiException as e:
+            self.session.rollback()
+            raise e
         except Exception as e:
             self.session.rollback()
             raise JsonApiException("Object creation error: " + str(e), source={'pointer': '/data'})
@@ -137,14 +146,22 @@ class SqlalchemyDataLayer(BaseDataLayer):
         self.before_update_object(obj, data, view_kwargs)
 
         relationship_fields = get_relationships(self.resource.schema, model_field=True)
+        nested_fields = get_nested_fields(self.resource.schema, model_field=True)
+
+        join_fields = relationship_fields + nested_fields
+
         for key, value in data.items():
-            if hasattr(obj, key) and key not in relationship_fields:
+            if hasattr(obj, key) and key not in join_fields:
                 setattr(obj, key, value)
 
         self.apply_relationships(data, obj)
+        self.apply_nested_fields(data, obj)
 
         try:
             self.session.commit()
+        except JsonApiException as e:
+            self.session.rollback()
+            raise e
         except Exception as e:
             self.session.rollback()
             raise JsonApiException("Update object error: " + str(e), source={'pointer': '/data'})
@@ -168,6 +185,9 @@ class SqlalchemyDataLayer(BaseDataLayer):
         self.session.delete(obj)
         try:
             self.session.commit()
+        except JsonApiException as e:
+            self.session.rollback()
+            raise e
         except Exception as e:
             self.session.rollback()
             raise JsonApiException("Delete object error: " + str(e))
@@ -222,6 +242,9 @@ class SqlalchemyDataLayer(BaseDataLayer):
 
         try:
             self.session.commit()
+        except JsonApiException as e:
+            self.session.rollback()
+            raise e
         except Exception as e:
             self.session.rollback()
             raise JsonApiException("Create relationship error: " + str(e))
@@ -318,6 +341,9 @@ class SqlalchemyDataLayer(BaseDataLayer):
 
         try:
             self.session.commit()
+        except JsonApiException as e:
+            self.session.rollback()
+            raise e
         except Exception as e:
             self.session.rollback()
             raise JsonApiException("Update relationship error: " + str(e))
@@ -365,6 +391,9 @@ class SqlalchemyDataLayer(BaseDataLayer):
 
         try:
             self.session.commit()
+        except JsonApiException as e:
+            self.session.rollback()
+            raise e
         except Exception as e:
             self.session.rollback()
             raise JsonApiException("Delete relationship error: " + str(e))
@@ -391,6 +420,7 @@ class SqlalchemyDataLayer(BaseDataLayer):
                                                                      obj['id']))
 
         return related_object
+
 
     def apply_relationships(self, data, obj):
         """Apply relationship provided by data to obj
@@ -425,6 +455,37 @@ class SqlalchemyDataLayer(BaseDataLayer):
 
         for relationship in relationships_to_apply:
             setattr(obj, relationship['field'], relationship['value'])
+
+    def apply_nested_fields(self, data, obj):
+        nested_fields_to_apply = []
+        nested_fields = get_nested_fields(self.resource.schema, model_field=True)
+        for key, value in data.items():
+            if key in nested_fields:
+                nested_field_inspection = inspect(getattr(obj.__class__, key))
+
+                if not isinstance(nested_field_inspection, QueryableAttribute):
+                    raise InvalidType("Unrecognized nested field type: not a queryable attribute.")
+
+                if isinstance(nested_field_inspection.property, RelationshipProperty):
+                    nested_model = getattr(obj.__class__, key).property.mapper.class_
+
+                    if isinstance(value, list):
+                        nested_objects = []
+
+                        for identifier in value:
+                            nested_object = nested_model(**identifier)
+                            nested_objects.append(nested_object)
+
+                        nested_fields_to_apply.append({'field': key, 'value': nested_objects})
+                    else:
+                        nested_fields_to_apply.append({'field': key, 'value': nested_model(**value)})
+                elif isinstance(nested_field_inspection.property, ColumnProperty):
+                    nested_fields_to_apply.append({'field': key, 'value': value})
+                else:
+                    raise InvalidType("Unrecognized nested field type: not a RelationshipProperty or ColumnProperty.")
+
+        for nested_field in nested_fields_to_apply:
+            setattr(obj, nested_field['field'], nested_field['value'])
 
     def filter_query(self, query, filter_info, model):
         """Filter query according to jsonapi 1.0

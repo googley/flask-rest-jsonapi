@@ -8,6 +8,7 @@ import inspect
 from functools import wraps
 
 from flask_rest_jsonapi.resource import ResourceList, ResourceRelationship
+from flask_rest_jsonapi.decorators import jsonapi_exception_formatter
 
 
 class Api(object):
@@ -29,7 +30,7 @@ class Api(object):
         if app is not None:
             self.init_app(app, blueprint)
 
-    def init_app(self, app=None, blueprint=None):
+    def init_app(self, app=None, blueprint=None, additional_blueprints=None):
         """Update flask application with our api
 
         :param Application app: a flask application
@@ -49,6 +50,10 @@ class Api(object):
         if self.blueprint is not None:
             self.app.register_blueprint(self.blueprint)
 
+        if additional_blueprints is not None:
+            for blueprint in additional_blueprints:
+                self.app.register_blueprint(blueprint)
+
         self.app.config.setdefault('PAGE_SIZE', 30)
 
     def route(self, resource, view, *urls, **kwargs):
@@ -60,7 +65,6 @@ class Api(object):
         :param dict kwargs: additional options of the route
         """
         resource.view = view
-        view_func = resource.as_view(view)
         url_rule_options = kwargs.get('url_rule_options') or dict()
 
         for decorator in self.decorators:
@@ -69,7 +73,13 @@ class Api(object):
             else:
                 resource.decorators = self.decorators
 
-        if self.blueprint is not None:
+        view_func = resource.as_view(view)
+
+        if 'blueprint' in kwargs:
+            resource.view = '.'.join([kwargs['blueprint'].name, resource.view])
+            for url in urls:
+                kwargs['blueprint'].add_url_rule(url, view_func=view_func, **url_rule_options)
+        elif self.blueprint is not None:
             resource.view = '.'.join([self.blueprint.name, resource.view])
             for url in urls:
                 self.blueprint.add_url_rule(url, view_func=view_func, **url_rule_options)
@@ -147,6 +157,7 @@ class Api(object):
                 return view
 
             @wraps(view)
+            @jsonapi_exception_formatter
             def decorated(*view_args, **view_kwargs):
                 return self.check_permissions(view, view_args, view_kwargs, *args, **kwargs)
             decorated._has_permissions_decorator = True

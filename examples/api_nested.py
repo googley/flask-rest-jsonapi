@@ -6,6 +6,7 @@ from flask_rest_jsonapi.exceptions import ObjectNotFound
 from flask_sqlalchemy import SQLAlchemy
 from sqlalchemy.orm.exc import NoResultFound
 from marshmallow_jsonapi.flask import Schema, Relationship
+from marshmallow import Schema as MarshmallowSchema
 from marshmallow_jsonapi import fields
 
 # Create the Flask application
@@ -26,6 +27,9 @@ class Person(db.Model):
     email = db.Column(db.String)
     birth_date = db.Column(db.Date)
     password = db.Column(db.String)
+    tags = db.relationship("Person_Tag", cascade="save-update, merge, delete, delete-orphan")
+    single_tag = db.relationship("Person_Single_Tag", uselist=False, cascade="save-update, merge, delete, delete-orphan")
+    json_tags = db.Column(db.JSON)
 
 
 class Computer(db.Model):
@@ -34,7 +38,37 @@ class Computer(db.Model):
     person_id = db.Column(db.Integer, db.ForeignKey('person.id'))
     person = db.relationship('Person', backref=db.backref('computers'))
 
+
+class Person_Tag(db.Model):
+    id = db.Column(db.Integer, db.ForeignKey('person.id'), primary_key=True, index=True)
+    key = db.Column(db.String, primary_key=True)
+    value = db.Column(db.String, primary_key=True)
+
+
+class Person_Single_Tag(db.Model):
+    id = db.Column(db.Integer, db.ForeignKey('person.id'), primary_key=True, index=True)
+    key = db.Column(db.String)
+    value = db.Column(db.String)
+
 db.create_all()
+
+# Create schema
+class PersonTagSchema(MarshmallowSchema):
+    class Meta:
+        type_ = 'person_tag'
+
+    id = fields.Str(dump_only=True, load_only=True)
+    key = fields.Str()
+    value = fields.Str()
+
+
+class PersonSingleTagSchema(MarshmallowSchema):
+    class Meta:
+        type_ = 'person_single_tag'
+
+    id = fields.Str(dump_only=True, load_only=True)
+    key = fields.Str()
+    value = fields.Str()
 
 
 # Create logical data abstraction (same as data storage for this first example)
@@ -46,7 +80,7 @@ class PersonSchema(Schema):
         self_view_many = 'person_list'
 
     id = fields.Integer(as_string=True, dump_only=True)
-    name = fields.Str(required=True, load_only=True)
+    name = fields.Str(requried=True, load_only=True)
     email = fields.Email(load_only=True)
     birth_date = fields.Date()
     display_name = fields.Function(lambda obj: "{} <{}>".format(obj.name.upper(), obj.email))
@@ -57,6 +91,7 @@ class PersonSchema(Schema):
                              many=True,
                              schema='ComputerSchema',
                              type_='computer')
+    tags = fields.Nested(PersonTagSchema, many=True)
 
 
 class ComputerSchema(Schema):
@@ -66,7 +101,7 @@ class ComputerSchema(Schema):
         self_view_kwargs = {'id': '<id>'}
 
     id = fields.Integer(as_string=True, dump_only=True)
-    serial = fields.Str(required=True)
+    serial = fields.Str(requried=True)
     owner = Relationship(attribute='person',
                          self_view='computer_person',
                          self_view_kwargs={'id': '<id>'},
@@ -74,6 +109,7 @@ class ComputerSchema(Schema):
                          related_view_kwargs={'computer_id': '<id>'},
                          schema='PersonSchema',
                          type_='person')
+
 
 
 # Create resource managers

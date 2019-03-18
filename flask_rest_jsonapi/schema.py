@@ -4,7 +4,7 @@
 
 from marshmallow import class_registry
 from marshmallow.base import SchemaABC
-from marshmallow_jsonapi.fields import Relationship
+from marshmallow_jsonapi.fields import Relationship, List, Nested
 
 from flask_rest_jsonapi.exceptions import InvalidInclude
 
@@ -66,6 +66,8 @@ def compute_schema(schema_cls, default_kwargs, qs, include):
             relation_field = schema.declared_fields[field]
             related_schema_cls = schema.declared_fields[field].__dict__['_Relationship__schema']
             related_schema_kwargs = {}
+            if 'context' in default_kwargs:
+                related_schema_kwargs['context'] = default_kwargs['context']
             if isinstance(related_schema_cls, SchemaABC):
                 related_schema_kwargs['many'] = related_schema_cls.many
                 related_schema_cls = related_schema_cls.__class__
@@ -94,6 +96,25 @@ def get_model_field(schema, field):
         return schema._declared_fields[field].attribute
     return field
 
+def get_nested_fields(schema, model_field=False):
+    """Return nested fields of a schema to support a join
+
+    :param Schema schema: a marshmallow schema
+    :param boolean model_field: whether to extract the model field for the nested fields
+    :return list: list of nested fields of the schema
+    """
+
+    nested_fields = []
+    for (key, value) in schema._declared_fields.items():
+        if isinstance(value, List) and isinstance(value.container, Nested):
+            nested_fields.append(key)
+        elif isinstance(value, Nested):
+            nested_fields.append(key)
+
+    if model_field is True:
+        nested_fields = [get_model_field(schema, key) for key in nested_fields]
+
+    return nested_fields
 
 def get_relationships(schema, model_field=False):
     """Return relationship fields of a schema
